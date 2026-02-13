@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import statistics
 from pathlib import Path
 from typing import Any
 from urllib import parse, request
@@ -9,6 +10,12 @@ from urllib import parse, request
 
 def _strip_html(raw: str) -> str:
     return raw.replace("<p>", "").replace("</p>", "").strip()
+
+
+def _read_json(url: str, timeout: int = 15) -> tuple[Any, Any]:
+    with request.urlopen(url, timeout=timeout) as response:  # nosec: B310
+        payload = json.loads(response.read().decode("utf-8"))
+        return payload, response.headers
 
 
 def normalize_post(post: dict[str, Any]) -> dict[str, str]:
@@ -30,11 +37,86 @@ def build_posts_url(site_url: str, limit: int) -> str:
 
 def fetch_posts(site_url: str, limit: int = 20, timeout: int = 15) -> list[dict[str, str]]:
     url = build_posts_url(site_url=site_url, limit=limit)
-    with request.urlopen(url, timeout=timeout) as response:  # nosec: B310
-        payload = json.loads(response.read().decode("utf-8"))
+    payload, _ = _read_json(url=url, timeout=timeout)
     if not isinstance(payload, list):
         raise ValueError("Expected a list of posts from WordPress API.")
     return [normalize_post(item) for item in payload if isinstance(item, dict)]
+
+
+def analyze_traffic_series(series: list[int]) -> dict[str, Any]:
+    if not series:
+        return {
+            "available": False,
+            "trend": "unknown",
+            "last_7_avg": 0.0,
+            "previous_7_avg": 0.0,
+            "change_pct": 0.0,
+        }
+
+    last_7 = series[-7:]
+    previous_7 = series[-14:-7]
+    last_7_avg = float(statistics.fmean(last_7))
+    previous_7_avg = float(statistics.fmean(previous_7)) if previous_7 else last_7_avg
+    if previous_7_avg == 0:
+        change_pct = 0.0
+    else:
+        change_pct = ((last_7_avg - previous_7_avg) / previous_7_avg) * 100
+
+    trend = "stable"
+    if change_pct >= 5:
+        trend = "up"
+    if change_pct <= -5:
+        trend = "down"
+
+    return {
+        "available": True,
+        "trend": trend,
+        "last_7_avg": round(last_7_avg, 2),
+        "previous_7_avg": round(previous_7_avg, 2),
+        "change_pct": round(change_pct, 2),
+    }
+
+
+def fetch_site_metrics(
+    site_url: str,
+    timeout: int = 15,
+    traffic_endpoint: str | None = None,
+) -> dict[str, Any]:
+    base = site_url.rstrip("/")
+    posts_url = f"{base}/wp-json/wp/v2/posts?{parse.urlencode({'per_page': '1'})}"
+    pages_url = f"{base}/wp-json/wp/v2/pages?{parse.urlencode({'per_page': '1'})}"
+    comments_url = f"{base}/wp-json/wp/v2/comments?{parse.urlencode({'per_page': '1'})}"
+
+    _, post_headers = _read_json(url=posts_url, timeout=timeout)
+    _, page_headers = _read_json(url=pages_url, timeout=timeout)
+    _, comment_headers = _read_json(url=comments_url, timeout=timeout)
+
+    traffic_series: list[int] = []
+    if traffic_endpoint:
+        traffic_payload, _ = _read_json(url=traffic_endpoint, timeout=timeout)
+        if isinstance(traffic_payload, list):
+            traffic_series = [
+                int(item.get("visits", 0))
+                for item in traffic_payload
+                if isinstance(item, dict) and str(item.get("visits", "")).isdigit()
+            ]
+        elif isinstance(traffic_payload, dict):
+            raw_series = traffic_payload.get("daily_visits", [])
+            if isinstance(raw_series, list):
+                traffic_series = [
+                    int(item.get("visits", 0))
+                    for item in raw_series
+                    if isinstance(item, dict) and str(item.get("visits", "")).isdigit()
+                ]
+
+    traffic = analyze_traffic_series(series=traffic_series)
+    return {
+        "post_count": int(post_headers.get("X-WP-Total", "0")),
+        "page_count": int(page_headers.get("X-WP-Total", "0")),
+        "comment_count": int(comment_headers.get("X-WP-Total", "0")),
+        "traffic": traffic,
+        "traffic_samples": len(traffic_series),
+    }
 
 
 def load_state(path: Path) -> dict[str, str]:
@@ -66,11 +148,36 @@ def detect_changes(
     return changes
 
 
-def build_prompt(site_url: str, changes: list[dict[str, str]]) -> str:
+def build_prompt(site_url: str, changes: list[dict[str, str]], metrics: dict[str, Any]) -> str:
+    traffic = metrics.get("traffic", {})
+    traffic_details = (
+        "Traffic: trend={trend}, last7_avg={last}, prev7_avg={prev}, "
+        "change={delta}% across {samples} samples."
+    ).format(
+        trend=traffic.get("trend", "unknown"),
+        last=traffic.get("last_7_avg", 0),
+        prev=traffic.get("previous_7_avg", 0),
+        delta=traffic.get("change_pct", 0),
+        samples=metrics.get("traffic_samples", 0),
+    )
+    traffic_line = (
+        "Traffic: unavailable (provide --traffic-endpoint to enable visit trend analysis)."
+        if not traffic.get("available")
+        else traffic_details
+    )
     lines = [
         f"WordPress site: {site_url}",
         "You are monitoring content changes.",
-        "Summarize what changed and provide 3 operational recommendations.",
+        (
+            "Summarize what changed, assess traffic/health implications, and "
+            "provide 3 operational recommendations."
+        ),
+        "",
+        "Site metrics snapshot:",
+        f"- Posts: {metrics.get('post_count', 0)}",
+        f"- Pages: {metrics.get('page_count', 0)}",
+        f"- Comments: {metrics.get('comment_count', 0)}",
+        f"- {traffic_line}",
         "",
         "Changed posts:",
     ]
@@ -120,11 +227,14 @@ def run_monitor(
     state_file: Path,
     use_claude: bool,
     api_key: str | None,
+    traffic_endpoint: str | None = None,
     fetcher: Any = fetch_posts,
+    metrics_fetcher: Any = fetch_site_metrics,
     summarizer: Any = summarize_with_claude,
 ) -> dict[str, Any]:
     previous_state = load_state(state_file)
     posts = fetcher(site_url)
+    metrics = metrics_fetcher(site_url, traffic_endpoint=traffic_endpoint)
     changes = detect_changes(previous_state=previous_state, posts=posts)
 
     new_state = {post["id"]: post["modified"] for post in posts}
@@ -134,9 +244,9 @@ def run_monitor(
     if changes and use_claude:
         if not api_key:
             raise ValueError("ANTHROPIC_API_KEY is required when Claude summarization is enabled.")
-        prompt = build_prompt(site_url=site_url, changes=changes)
+        prompt = build_prompt(site_url=site_url, changes=changes, metrics=metrics)
         summary = summarizer(api_key=api_key, prompt=prompt)
-    return {"changes": changes, "summary": summary}
+    return {"changes": changes, "summary": summary, "metrics": metrics}
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -150,6 +260,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Disable Claude call and only report detected changes.",
     )
+    parser.add_argument(
+        "--traffic-endpoint",
+        required=False,
+        help="Optional JSON endpoint returning daily visits data.",
+    )
     return parser
 
 
@@ -162,11 +277,22 @@ def main() -> int:
         state_file=Path(args.state_file),
         use_claude=not args.no_claude,
         api_key=None if args.no_claude else __import__("os").environ.get("ANTHROPIC_API_KEY"),
+        traffic_endpoint=args.traffic_endpoint,
     )
 
     print(f"Detected changes: {len(result['changes'])}")
     for item in result["changes"]:
         print(f"- [{item['change_type']}] {item['title']} ({item['modified']})")
+    metrics = result["metrics"]
+    traffic = metrics.get("traffic", {})
+    print(
+        "Metrics: posts={posts} pages={pages} comments={comments} traffic_trend={trend}".format(
+            posts=metrics.get("post_count", 0),
+            pages=metrics.get("page_count", 0),
+            comments=metrics.get("comment_count", 0),
+            trend=traffic.get("trend", "unknown"),
+        )
+    )
 
     if result["summary"]:
         print("\nClaude summary:\n")
